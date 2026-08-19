@@ -111,7 +111,7 @@ The `Merkle Root` represents the complete set of file paths and file hashes.
 ## 🚀 Usage
 
 ```bash
-git clone https://github.com/username/evidence-hash-tool.git
+git clone https://github.com/wangyifan349/evidence-hash-tool.git
 cd evidence-hash-tool
 python evidence_hash_simple.py
 ```
