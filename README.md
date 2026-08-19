@@ -112,13 +112,9 @@ The `Merkle Root` represents the complete set of file paths and file hashes.
 
 ```bash
 git clone https://github.com/username/evidence-hash-tool.git
-
 cd evidence-hash-tool
-
 python evidence_hash_simple.py
 ```
-
-Replace `username` with your GitHub username.
 
 After startup, enter the directory that contains the files you want to hash.
 
@@ -139,9 +135,7 @@ inside that directory.
 ---
 
 ## 📄 Example: Final TXT Output
-
 Assume the directory contains:
-
 ```text
 Evidence/
 ├── screenshots/
@@ -152,9 +146,7 @@ Evidence/
 └── documents/
     └── export.pdf
 ```
-
 The generated `evidence_hashes.txt` may look like this:
-
 ```text
 documents/export.pdf
 0b9d8b9d15e7f3a9c31c4eac3cd20f1da6b60986396ea68ab32dbab5830a6a46
