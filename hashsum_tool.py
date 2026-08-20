@@ -1,264 +1,314 @@
-"""
-This tool is designed to batch-calculate and verify SHA-256 hashes for files within a directory. It recursively records each file’s name, relative path, and corresponding hash value, and writes the results to a hash manifest. New records are appended without overwriting existing entries, while verification reads both the manifest and target files in read-only mode, recalculates their hashes, and identifies files that are unchanged, modified, missing, or unreadable. Large files are processed in chunks to avoid loading the entire file into memory.
-"""
 import hashlib
-import os
-import threading
-import tkinter as tk
-from datetime import datetime
+import hmac
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
-
-CHUNK_SIZE = 1024 * 1024  # 1 MiB
 
 
-def sha256_file(path):
-    h = hashlib.sha256()
-    with open(path, "rb") as f:  # 始终只读证据文件
-        for chunk in iter(lambda: f.read(CHUNK_SIZE), b""):
-            h.update(chunk)
-    return h.hexdigest()
+OUTPUT_NAME = "evidence_hashes.txt"
+CHAIN_OUTPUT_NAME = "evidence_hash_chain.txt"
+BUFFER_SIZE = 1024 * 1024
 
 
-class HashSumApp:
-    def __init__(self, root):
-        self.root = root
-        self.root.title("HashSum")
-        self.root.geometry("900x620")
-        self.folder = tk.StringVar()
+def sha256_file(file_path: Path) -> str:
+    """Calculate the SHA-256 digest of a file."""
+    hasher = hashlib.sha256()
+    with file_path.open("rb") as file:
+        while True:
+            data = file.read(BUFFER_SIZE)
+            if not data:
+                break
+            hasher.update(data)
+    return hasher.hexdigest()
 
-        top = ttk.Frame(root, padding=12)
-        top.pack(fill="x")
 
-        ttk.Entry(top, textvariable=self.folder).pack(
-            side="left", fill="x", expand=True
-        )
-        ttk.Button(top, text="选择目录", command=self.choose_folder).pack(
-            side="left", padx=6
-        )
-        ttk.Button(top, text="生成 / 追加哈希", command=self.start_generate).pack(
-            side="left", padx=3
-        )
-        ttk.Button(top, text="校验", command=self.start_verify).pack(
-            side="left", padx=3
-        )
+def wait_for_exit() -> None:
+    """Keep the console window open until Enter is pressed."""
+    try:
+        input("\nPress Enter to exit...")
+    except (EOFError, KeyboardInterrupt):
+        pass
 
-        notebook = ttk.Notebook(root)
-        notebook.pack(fill="both", expand=True, padx=12, pady=(0, 12))
 
-        self.log = tk.Text(notebook, font=("Consolas", 10))
-        self.result = tk.Text(notebook, font=("Consolas", 10))
+def get_directory() -> Path | None:
+    """Read and validate the evidence directory."""
+    try:
+        directory_input = input("Enter the evidence directory: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print("\nCancelled.")
+        return None
 
-        notebook.add(self.log, text="运行日志")
-        notebook.add(self.result, text="校验结果")
+    directory_input = directory_input.strip('"').strip("'")
+    if not directory_input:
+        print("\nError: no directory was provided.")
+        return None
 
-        self.status = tk.StringVar(value="就绪")
-        ttk.Label(root, textvariable=self.status, anchor="w").pack(
-            fill="x", padx=12, pady=(0, 8)
-        )
+    try:
+        directory = Path(directory_input).expanduser().resolve()
+    except Exception as exc:
+        print(f"\nError: unable to resolve the directory: {exc}")
+        return None
 
-    def choose_folder(self):
-        path = filedialog.askdirectory()
-        if path:
-            self.folder.set(path)
+    if not directory.exists():
+        print("\nError: the directory does not exist.")
+        return None
+    if not directory.is_dir():
+        print("\nError: the provided path is not a directory.")
+        return None
 
-    def write_log(self, text):
-        self.root.after(0, lambda: (
-            self.log.insert("end", text + "\n"),
-            self.log.see("end")
-        ))
+    return directory
 
-    def write_result(self, text):
-        self.root.after(0, lambda: (
-            self.result.insert("end", text + "\n"),
-            self.result.see("end")
-        ))
 
-    def set_status(self, text):
-        self.root.after(0, self.status.set, text)
+def collect_files(directory: Path) -> list[Path]:
+    """Return files in stable relative-path order, excluding tool manifests."""
+    excluded_names = {OUTPUT_NAME, CHAIN_OUTPUT_NAME}
+    files = []
 
-    def files(self, folder, manifest):
-        for root, _, names in os.walk(folder):
-            for name in names:
-                path = Path(root) / name
+    for file_path in sorted(
+        directory.rglob("*"),
+        key=lambda path: path.relative_to(directory).as_posix(),
+    ):
+        if not file_path.is_file():
+            continue
+        if file_path.name in excluded_names:
+            continue
+        files.append(file_path)
 
-                # 清单文件本身不参与哈希
-                if path.resolve() == manifest.resolve():
-                    continue
+    return files
 
-                if path.is_file():
-                    yield path
 
-    def start_generate(self):
-        folder = self.folder.get().strip()
-        if not folder:
-            messagebox.showwarning("提示", "请先选择目录")
-            return
+def generate_manifest(directory: Path) -> None:
+    """Append new path + SHA-256 records without inserting exact duplicates."""
+    output_file = directory / OUTPUT_NAME
 
-        manifest = filedialog.asksaveasfilename(
-            title="选择或创建哈希清单",
-            defaultextension=".sha256",
-            filetypes=[("SHA256 清单", "*.sha256"), ("文本文件", "*.txt")]
-        )
+    try:
+        files = collect_files(directory)
+        existing_records = load_manifest(output_file) if output_file.is_file() else []
+    except Exception as exc:
+        print(f"\nError: failed to scan or read the existing manifest: {exc}")
+        return
 
-        if manifest:
-            threading.Thread(
-                target=self.generate,
-                args=(Path(folder), Path(manifest)),
-                daemon=True
-            ).start()
+    if not files:
+        print("\nNo files were found in the directory.")
+        return
 
-    def generate(self, folder, manifest):
-        self.set_status("正在计算哈希...")
-        self.write_log("=" * 60)
-        self.write_log(f"目录：{folder}")
+    existing_pairs = set(existing_records)
+    print(f"\nFound {len(files)} file(s).")
+    print(f"Loaded {len(existing_pairs)} unique existing record(s).")
+    print("Calculating SHA-256 hashes...\n")
 
-        count = 0
-        batch = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    new_records = []
+    skipped_count = 0
+    error_count = 0
 
-        # 只使用追加模式，不覆盖原有记录
-        with open(manifest, "a", encoding="utf-8", newline="\n") as out:
-            out.write(f"\n# HASH-BATCH {batch}\n")
-            out.write(f"# ROOT {folder.resolve()}\n")
-
-            for path in self.files(folder, manifest):
-                try:
-                    digest = sha256_file(path)
-                    relative = path.relative_to(folder).as_posix()
-
-                    out.write(f"{digest}\t{relative}\n")
-                    out.flush()
-
-                    count += 1
-                    self.write_log(f"[{count}] {relative}")
-                except OSError as e:
-                    self.write_log(f"[读取失败] {path}: {e}")
-
-        self.set_status(f"完成，共记录 {count} 个文件")
-
-        self.root.after(
-            0,
-            lambda: messagebox.showinfo(
-                "完成",
-                f"哈希计算完成\n\n文件数量：{count}\n清单：{manifest}"
-            )
-        )
-
-    def start_verify(self):
-        folder = self.folder.get().strip()
-        if not folder:
-            messagebox.showwarning("提示", "请先选择证据目录")
-            return
-
-        manifest = filedialog.askopenfilename(
-            title="选择哈希清单",
-            filetypes=[("哈希清单", "*.sha256 *.txt"), ("所有文件", "*.*")]
-        )
-
-        if manifest:
-            threading.Thread(
-                target=self.verify,
-                args=(Path(folder), Path(manifest)),
-                daemon=True
-            ).start()
-
-    def read_latest_batch(self, manifest):
-        # 清单只读
-        with open(manifest, "r", encoding="utf-8") as f:
-            lines = f.readlines()
-
-        start = 0
-
-        # 找最后一次批次
-        for i, line in enumerate(lines):
-            if line.startswith("# HASH-BATCH "):
-                start = i + 1
-
-        records = []
-
-        for line in lines[start:]:
-            line = line.rstrip("\n")
-
-            if not line or line.startswith("#"):
+    for index, file_path in enumerate(files, start=1):
+        relative_path = file_path.relative_to(directory).as_posix()
+        print(f"[{index}/{len(files)}] {relative_path}", end=": ")
+        try:
+            file_hash = sha256_file(file_path)
+            record = (relative_path, file_hash)
+            if record in existing_pairs:
+                skipped_count += 1
+                print("SKIPPED (already recorded)")
                 continue
 
-            if "\t" not in line:
-                continue
+            new_records.append(record)
+            existing_pairs.add(record)
+            print("APPEND")
+        except Exception as exc:
+            error_count += 1
+            print(f"ERROR ({exc})")
 
-            digest, relative = line.split("\t", 1)
-            records.append((digest, relative))
+    try:
+        if new_records:
+            needs_separator = output_file.is_file() and output_file.stat().st_size > 0
+            with output_file.open("a", encoding="utf-8", newline="\n") as file:
+                if needs_separator:
+                    file.write("\n")
+                for relative_path, file_hash in new_records:
+                    file.write(f"{relative_path}\n{file_hash}\n\n")
+    except Exception as exc:
+        print(f"\nError: failed to append to the output file: {exc}")
+        return
 
-        return records
-
-    def verify(self, folder, manifest):
-        self.set_status("正在校验...")
-        self.root.after(0, lambda: self.result.delete("1.0", "end"))
-
-        records = self.read_latest_batch(manifest)
-
-        success = 0
-        modified = 0
-        missing = 0
-        errors = 0
-
-        self.write_result("SHA-256 校验结果")
-        self.write_result("=" * 70)
-
-        for expected, relative in records:
-            path = folder / relative
-
-            if not path.exists():
-                missing += 1
-                self.write_result(f"[文件丢失] {relative}")
-                continue
-
-            try:
-                actual = sha256_file(path)
-
-                if actual.lower() == expected.lower():
-                    success += 1
-                    self.write_result(f"[校验成功] {relative}")
-                else:
-                    modified += 1
-                    self.write_result(
-                        f"[文件被修改] {relative}\n"
-                        f"  记录值：{expected}\n"
-                        f"  当前值：{actual}"
-                    )
-
-            except OSError as e:
-                errors += 1
-                self.write_result(f"[读取失败] {relative}: {e}")
-
-        total = len(records)
-
-        summary = (
-            "\n" + "=" * 70 +
-            f"\n总记录数：{total}"
-            f"\n校验成功：{success}"
-            f"\n内容变化：{modified}"
-            f"\n文件丢失：{missing}"
-            f"\n读取失败：{errors}"
-        )
-
-        self.write_result(summary)
-        self.set_status("校验完成")
-
-        self.root.after(
-            0,
-            lambda: messagebox.showinfo(
-                "校验完成",
-                f"总计：{total}\n"
-                f"成功：{success}\n"
-                f"修改：{modified}\n"
-                f"丢失：{missing}\n"
-                f"失败：{errors}"
-            )
-        )
+    print("\nCompleted.")
+    print(f"Scanned:  {len(files)}")
+    print(f"Appended: {len(new_records)}")
+    print(f"Skipped:  {skipped_count}")
+    print(f"Errors:   {error_count}")
+    print(f"TXT saved to: {output_file}")
 
 
-root = tk.Tk()
-HashSumApp(root)
-root.mainloop()
+def load_manifest(manifest_file: Path) -> list[tuple[str, str]]:
+    """Load and validate the simple two-line manifest format."""
+    lines = [
+        line
+        for line in manifest_file.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+    if not lines:
+        raise ValueError("the manifest is empty")
+    if len(lines) % 2 != 0:
+        raise ValueError("the manifest has an incomplete path/hash pair")
+
+    records = []
+    seen = set()
+    for index in range(0, len(lines), 2):
+        relative_path = lines[index]
+        expected_hash = lines[index + 1].strip().lower()
+
+        if len(expected_hash) != 64:
+            raise ValueError(f"invalid SHA-256 value for: {relative_path}")
+        try:
+            int(expected_hash, 16)
+        except ValueError as exc:
+            raise ValueError(f"invalid SHA-256 value for: {relative_path}") from exc
+
+        record = (relative_path, expected_hash)
+        if record not in seen:
+            seen.add(record)
+            records.append(record)
+
+    return records
 
 
+def latest_records(records: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    """Keep the latest hash for each relative path while preserving final path order."""
+    latest = {}
+    for relative_path, expected_hash in records:
+        latest[relative_path] = expected_hash
+    return list(latest.items())
+
+
+def resolve_manifest_path(directory: Path, relative_path: str) -> Path:
+    """Resolve a manifest path and reject paths outside the evidence directory."""
+    path = Path(relative_path)
+    if path.is_absolute():
+        raise ValueError("absolute path is not allowed")
+
+    resolved = (directory / path).resolve()
+    try:
+        resolved.relative_to(directory)
+    except ValueError as exc:
+        raise ValueError("path escapes the evidence directory") from exc
+
+    return resolved
+
+
+def verify_manifest(directory: Path) -> None:
+    """Verify files against the existing SHA-256 manifest."""
+    manifest_file = directory / OUTPUT_NAME
+
+    if not manifest_file.is_file():
+        print(f"\nError: {OUTPUT_NAME} was not found in the selected directory.")
+        return
+
+    try:
+        records = latest_records(load_manifest(manifest_file))
+    except Exception as exc:
+        print(f"\nError: failed to read the manifest: {exc}")
+        return
+
+    print(f"\nLoaded {len(records)} record(s).")
+    print("Verifying SHA-256 hashes...\n")
+
+    ok_count = 0
+    modified_count = 0
+    missing_count = 0
+    error_count = 0
+    expected_paths = set()
+
+    for index, (relative_path, expected_hash) in enumerate(records, start=1):
+        print(f"[{index}/{len(records)}] {relative_path}", end=": ")
+
+        try:
+            file_path = resolve_manifest_path(directory, relative_path)
+            expected_paths.add(file_path)
+        except Exception as exc:
+            error_count += 1
+            print(f"ERROR ({exc})")
+            continue
+
+        if not file_path.exists() or not file_path.is_file():
+            missing_count += 1
+            print("MISSING")
+            continue
+
+        try:
+            actual_hash = sha256_file(file_path)
+        except Exception as exc:
+            error_count += 1
+            print(f"ERROR ({exc})")
+            continue
+
+        if hmac.compare_digest(actual_hash, expected_hash):
+            ok_count += 1
+            print("OK")
+        else:
+            modified_count += 1
+            print("MODIFIED")
+            print(f"  Expected: {expected_hash}")
+            print(f"  Actual:   {actual_hash}")
+
+    new_files = []
+    try:
+        for file_path in collect_files(directory):
+            resolved = file_path.resolve()
+            if resolved not in expected_paths:
+                new_files.append(file_path.relative_to(directory).as_posix())
+    except Exception as exc:
+        error_count += 1
+        print(f"\nERROR while checking for new files: {exc}")
+
+    if new_files:
+        print("\nNew files not present in the manifest:")
+        for relative_path in new_files:
+            print(f"NEW: {relative_path}")
+
+    print("\nVerification summary")
+    print("-" * 40)
+    print(f"OK:       {ok_count}")
+    print(f"MODIFIED: {modified_count}")
+    print(f"MISSING:  {missing_count}")
+    print(f"NEW:      {len(new_files)}")
+    print(f"ERROR:    {error_count}")
+
+    if modified_count == 0 and missing_count == 0 and not new_files and error_count == 0:
+        print("\nResult: PASSED")
+    else:
+        print("\nResult: FAILED")
+
+
+def main() -> None:
+    print("Evidence File SHA-256 Hash Tool")
+    print("Generate and verify file hashes")
+    print()
+    print("[1] Generate hash manifest")
+    print("[2] Verify existing manifest")
+    print()
+
+    try:
+        mode = input("Select mode [1/2]: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print("\nCancelled.")
+        return
+
+    if mode not in {"1", "2"}:
+        print("\nError: please select 1 or 2.")
+        wait_for_exit()
+        return
+
+    directory = get_directory()
+    if directory is None:
+        wait_for_exit()
+        return
+
+    if mode == "1":
+        generate_manifest(directory)
+    else:
+        verify_manifest(directory)
+
+    wait_for_exit()
+
+
+if __name__ == "__main__":
+    main()
